@@ -592,6 +592,13 @@ union stm32_desc_u
   struct eth_desc_s   desc;
 };
 
+/* Index of a descriptor in its ring, for the buffer pointer shadows */
+
+#define TXIDX(p, d) (((uintptr_t)(d) - (uintptr_t)(p)->txchbase) / \
+                     sizeof(union stm32_desc_u))
+#define RXIDX(p, d) (((uintptr_t)(d) - (uintptr_t)(p)->rxchbase) / \
+                     sizeof(union stm32_desc_u))
+
 /* The stm32_ethmac_s encapsulates all state information for a single
  * hardware interface
  */
@@ -622,6 +629,11 @@ struct stm32_ethmac_s
   struct eth_desc_s *rxcurr;        /* First RX descriptor of the segment */
   uint16_t             segments;    /* RX segment count */
   uint16_t             inflight;    /* Number of TX transfers "in_flight" */
+
+  /* Buffer1 of each descriptor, the DMA may overwrite des0 on write-back */
+
+  uint8_t             *txbuf[CONFIG_STM32_ETH_NTXDESC];
+  uint8_t             *rxbuf[CONFIG_STM32_ETH_NRXDESC];
   sq_queue_t           freeb;       /* The free buffer list */
 
   struct mdio_bus_s *mdio;
@@ -1133,6 +1145,7 @@ static int stm32_transmit(struct stm32_ethmac_s *priv)
           /* Set the Buffer1 address pointer */
 
           txdesc->des0 = (uint32_t)buffer;
+          priv->txbuf[TXIDX(priv, txdesc)] = buffer;
 
           /* Set the Buffer2 address pointer */
 
@@ -1191,6 +1204,7 @@ static int stm32_transmit(struct stm32_ethmac_s *priv)
       /* Set the Buffer1 address pointer */
 
       txdesc->des0 = (uint32_t)priv->dev.d_buf;
+      priv->txbuf[TXIDX(priv, txdesc)] = priv->dev.d_buf;
 
       /* Set the Buffer2 address pointer */
 
@@ -1332,7 +1346,7 @@ static int stm32_txpoll(struct net_driver_s *dev)
    */
 
   if ((priv->txhead->des3 & ETH_TDES3_RD_OWN) != 0 ||
-      priv->txhead->des0 != 0)
+      priv->txbuf[TXIDX(priv, priv->txhead)] != NULL)
     {
       /* We have to terminate the poll if we have no more descriptors
        * available for another transfer.
@@ -1405,7 +1419,7 @@ static void stm32_dopoll(struct stm32_ethmac_s *priv)
    */
 
   if ((priv->txhead->des3 & ETH_TDES3_RD_OWN) == 0 &&
-      priv->txhead->des0 == 0)
+      priv->txbuf[TXIDX(priv, priv->txhead)] == NULL)
     {
       /* If we have the descriptor, then poll the network for new XMIT data.
        * Allocate a buffer for the poll.
@@ -1574,6 +1588,7 @@ static void stm32_freesegment(struct stm32_ethmac_s *priv,
     {
       /* Set OWN bit in RX descriptors.  This gives the buffers back to DMA */
 
+      rxdesc->des0 = (uint32_t)priv->rxbuf[RXIDX(priv, rxdesc)];
       rxdesc->des3 = ETH_RDES3_RD_OWN | ETH_RDES3_RD_IOC |
                      ETH_RDES3_RD_BUF1V;
 
@@ -1785,8 +1800,9 @@ static int stm32_recvframe(struct stm32_ethmac_s *priv)
                        */
 
                       DEBUGASSERT(dev->d_buf == NULL);
-                      dev->d_buf    = (uint8_t *)rxcurr->des0;
+                      dev->d_buf    = priv->rxbuf[RXIDX(priv, rxcurr)];
                       rxcurr->des0 = (uint32_t)buffer;
+                      priv->rxbuf[RXIDX(priv, rxcurr)] = buffer;
 
                       /* Make sure that the modified RX descriptor is written
                        * to physical memory.
@@ -2056,11 +2072,12 @@ static void stm32_freeframe(struct stm32_ethmac_s *priv)
                 " des2: %08" PRIx32 " des3: %08" PRIx32 "\n",
                 txdesc, txdesc->des0, txdesc->des2, txdesc->des3);
 
-          DEBUGASSERT(txdesc->des0 != 0);
+          DEBUGASSERT(priv->txbuf[TXIDX(priv, txdesc)] != NULL);
 
           /* Yes.. Free the buffer */
 
-          stm32_freebuffer(priv, (uint8_t *)txdesc->des0);
+          stm32_freebuffer(priv, priv->txbuf[TXIDX(priv, txdesc)]);
+          priv->txbuf[TXIDX(priv, txdesc)] = NULL;
 
           /* In any event, make sure that des0-3 are nullified. */
 
@@ -2789,6 +2806,7 @@ static void stm32_txdescinit(struct stm32_ethmac_s *priv,
 
   priv->txhead = &txtable[0].desc;
   priv->txchbase = &txtable[0].desc;
+  memset(priv->txbuf, 0, sizeof(priv->txbuf));
 
   /* priv->txtail will point to the first segment of the oldest pending
    * "in-flight" TX transfer.  NULL means that there are no active TX
@@ -2896,6 +2914,7 @@ static void stm32_rxdescinit(struct stm32_ethmac_s *priv,
       /* Set Buffer1 address pointer */
 
       rxdesc->des0 = (uint32_t)&rxbuffer[i * ALIGNED_BUFSIZE];
+      priv->rxbuf[i] = &rxbuffer[i * ALIGNED_BUFSIZE];
 
       /* Set Buffer1 address high bytes */
 
